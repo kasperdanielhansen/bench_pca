@@ -1,0 +1,118 @@
+---
+title: "PCA theory"
+author: 
+  - Kasper D. Hansen
+package: bpca
+bibliography: bpca.bib
+abstract: >
+  Big PCA	
+vignette: >
+  %\VignetteIndexEntry{bpca}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+output: 
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Problem and analysis
+
+We want to do a PCA of a scRNA matrix $A$ of dimension $m \times n$ with $m$ being the number of genes (features, on the order of 20-50k) and $n$ being the number of cells (samples, we want to handle 1.3M and be prepared for 10-100M). This layout is the transpose of the classic statistics layout.
+
+In its rawest form $A$ is an integer matrix, with a decent to large amount of zeroes.  For the 10X 68k PBMC data we have
+- $m = 32,768$ genes
+- $n = 68,579$ cells
+- Number of rows which are completely zero: $12,351$ (so the matrix is effectively 20k by 68k).
+- Number of non-zero cells: 98.3% 
+- Number of non-zero cells after removing all-zero rows: 97.3%
+For this dataset we have a high degree of sparsity.
+
+**Preprocessing:** We almost always want to preprocess the data first. At its simplest form we want to estimate size factors (one per cell) $L_n$ and do something like
+$$
+\log_2 (a_{ij} / L_j + 1)
+$$
+This transformation does not change the sparsity of the matrix (although if we had $a_{ij} + 
+
+**Centering and scaling:** For PCA we want to mean center each row and perhaps divide by the standard deviation (we call this the scaled matrix $\tilde{A}$). Naively, this transformation makes the resulting matrix dense, but it is possible to incorporate this transformation into the following algorithms, exploiting that the scaled matrix is essentially a matrix of the same sparsity as the original matrix minus a particularly simple matrix.
+
+**Goal**. We need to get the SVD of the scaled matrix
+$$
+\tilde{A} = U D V^t
+$$
+where $U$ is $m \times r$, $D$ is an $r \times r$ diagonal matrix and $V$ is an $n \times r$ matrix where $r$ is the rank of $\tilde{A}$. In practice we just want the first $k$ principal components where $k$ could be 50 or sometimes as low as 2. In addition, we are not interested in $U$, only in $D$ and $V$.  If we only get the first $k$ principal components we also need to get the sum of the trace of $D$ (total variation) to be able to compute the percent explained variation for each PC.  We can get the sum of that trace by **FIX**
+
+We assume (for now) that we are able to have the $V$ matrix in memory, or sometimes a matrix slightly bigger than $V$ (for example an $n \times (k+2)$ matrix).  If $n$ is 1.3M and $k$ is 50 that takes up 520 Mb. Clearly for $n$ going towards 10M or 100M, that is not going to be true, and we need to allow for the final output (and possibly intermediate output) to be stored on disk which will add more complexity to the analysis below.
+
+It turns out that the algorithms below work by computing products like
+- $AA^t$ ($m \times m) (requires $m^2n$ flops)
+- $AH_{n \times k}, H_{k \times m}A$ (requires $2mnk$ flops).
+- $Ay_n, y_mA$ (requires $2mn$ flops).
+Here $y_m,y_n$ are dense vectors of length $m,n$ and $H$ are dense matrices with "smaller" dimensions. A flop is either a multiplication or addition, and the number of flops is for the case where everything is dense (which is not true). Substantial computational savings can be made here exploiting sparsity of $A$ and also building the scaling of $A$ into these products.
+
+The different algorithms to some extent trades off bigger computations (like the cross-product) with data-access. For example, the algorithm build around $Ay, yA$ needs to compute these matrix-vector products many times and therefore needs to access $A$ many times. The efficiency of this depends on data access vs. multiplications.
+
+# Using the full cross-product
+
+If 
+$$
+A = U D V^t
+$$
+then
+$$
+AA^t = U D^2 U^t
+$$
+and 
+$$
+U^tD^{-1}A= V^t
+$$
+This means that we can compute the SVD by forming the cross-product $AA^t$ (which is $m \times m$ and therefore small), do an SVD on this smaller matrix and get the right singular values by forming a matrix-product of the form $HA$. Since forming the cross-product can be done in parallel using a single pass over the data matrix, this is an efficient approach wrt. data access.  However, it requires $m^2n + 2kmn = mn(m+2k)$ flops 
+
+## In-memory cross-product timings
+
+Using the PBMC 68k data with zero rows removed (20k by 68k) we get the following timings on the JHPCE cluster node, using standard (ie. not multi-threaded) single core BLAS
+- dense algebra for the integer matrix: 414s
+- sparse algebra for the integer matrix: 116s (cost of converting a dense integer matrix to a `dgCMatrix`: 9.3s)
+This is without scaling. Still need to write a `crossprod()` which does scaling as part of the product.
+
+
+
+
+
+# Existing implementations
+
+We have the following interesting packages for large-scale SVD / PCA:
+
+- `irlba` [CRAN](https://cran.r-project.org/package=irlba) [Github](https://bwlewis.github.io/irlba/)
+- `Rspectra` [CRAN]() [Github]()
+- `rsvd` [CRAN]() [Github]()
+- `bigstatsr` [CRAN]() [Github]()
+
+
+# The Matrix package
+
+This package has classes for dense matrices (`dgeMatrix`) and sparse matrices (`dgCMatrox` for compressed column oriented storage and `dgTMatrix` for triplet storage).   
+
+Construction: `Matrix(...)` or `Matrix(..., sparse = TRUE)` or (more efficiently) `sparseMatrix(...)`
+
+Question: what are the limits of `dgeMatrix` and `dgCMatrix` wrt. dimensions and non-zero entries?
+
+# Random notes to be organized
+
+- irlba vs Rspectra comparison form the author of irlba [comparison](https://bwlewis.github.io/irlba/comparison.html). Claims that Rspectra is better for eigenvalues and irlba is better for SVDs.
+- fast algorithms for PCA [comparison](https://privefl.github.io/blog/fast-r-functions-to-get-first-principal-components/) by the author of `bigstatsr`.
+- using irlba in an out--of-memory approach on 1kG data: [notes](http://bwlewis.github.io/1000_genomes_examples/notes.html) [examples](http://bwlewis.github.io/1000_genomes_examples/#1000_genomes_examples)
+- paper on thresholded correlation matrix [tcor](https://arxiv.org/abs/1512.07246)
+- basic turtorial on SVD and PCA in R [ph525](http://genomicsclass.github.io/book/pages/pca_svd.html)
+
+
+- (Fun) [Scalability but at cost](http://www.frankmcsherry.org/graph/scalability/cost/2015/01/15/COST.html)
+
+# Sessioninfo
+
+``{r sessionInfo, results='asis', echo=FALSE}
+sessionInfo()
+```
+
+# References
+
+
